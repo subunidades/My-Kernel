@@ -18,14 +18,14 @@ cabal update
 cabal build
 
 # 3. Synthesize to SystemVerilog
-rm -rf verilog
+rm -rf systemverilog
 cabal run clash -- --systemverilog Consensus.hs
 
 # 4. Bundle generated .sv files (type files first) + test wrapper into one file
 OUT=makerchip_bundle.sv
 : > "$OUT"
-for f in $(find verilog -name '*types*.sv' | sort) \
-         $(find verilog -name '*.sv' ! -name '*types*' | sort); do
+for f in $(find systemverilog -name '*types*.sv' | sort) \
+         $(find systemverilog -name '*.sv' ! -name '*types*' | sort); do
   cat "$f" >> "$OUT"; echo >> "$OUT"
 done
 cat sim/wrapper.sv >> "$OUT"
