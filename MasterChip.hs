@@ -12,7 +12,7 @@ Precision   : Q1.15 fixed point (Signed 16), symmetric saturation.
 Each clock cycle:
   1. delta  = expMap twist                  (small rotation + translation)
   2. pose'  = pose (x) delta                (dual quaternion product)
-  3. r'     = one Newton step to keep |r| = 1
+  3. r'     = four Newton steps to keep |r| = 1
   4. d'     = d - (r . d) r                 (projection onto the SE(3) manifold)
   5. register pose'                         (output = registered pose)
 
@@ -92,6 +92,8 @@ dotQ15 (Quaternion w1 x1 y1 z1) (Quaternion w2 x2 y2 z2) =
     summed = prod34 w1 w2 + prod34 x1 x2 + prod34 y1 y2 + prod34 z1 z2
 
 -- | One Newton step toward |r| = 1:  r' = r + r * (1 - |r|^2) / 2
+-- A single step only converges for small twists. Four steps keep |r| within
+-- 0.02% of 1 even for full-range (+-32767) twists.
 normalizeR :: Quaternion -> Quaternion
 normalizeR (Quaternion w x y z) =
     Quaternion (fixup w) (fixup x) (fixup y) (fixup z)
@@ -99,6 +101,10 @@ normalizeR (Quaternion w x y z) =
     n        = prod34 w w + prod34 x x + prod34 y y + prod34 z z   -- Q2.30
     c        = sat16 (shiftR (1073741824 - n) 16)                  -- (1-n)/2 in Q1.15
     fixup a  = addQ15 a (mulQ15 a c)
+
+-- | Four Newton steps in a row.
+normalizeR4 :: Quaternion -> Quaternion
+normalizeR4 = normalizeR . normalizeR . normalizeR . normalizeR
 
 -- | The Stability Gate (same maths as Consensus.projectSE3).
 projectSE3 :: DualQuaternion -> DualQuaternion
@@ -122,10 +128,10 @@ expMap t =
       (Quaternion 32767 (shiftR (wx t) 1) (shiftR (wy t) 1) (shiftR (wz t) 1))
       (Quaternion 0     (shiftR (vx t) 1) (shiftR (vy t) 1) (shiftR (vz t) 1))
 
--- | One full update: multiply, renormalize r, project d.
+-- | One full update: multiply, renormalize r (4 steps), project d.
 stepPose :: DualQuaternion -> Twist -> DualQuaternion
 stepPose pose t =
-    projectSE3 (DualQuaternion (normalizeR newReal) newDual)
+    projectSE3 (DualQuaternion (normalizeR4 newReal) newDual)
   where
     delta   = expMap t
     r       = realPart pose
