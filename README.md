@@ -65,6 +65,61 @@ flowchart TD
   REG --> POUT["pose_out 128 bit"]
 ```
 
+### Gate-level data path
+
+Drawn from the generated `chip` module (`systemverilog/MasterChip.topEntity/chip.sv`).
+"RESCALE" is a right shift by 15 followed by a clamp to the symmetric Q1.15
+range. "SAT ADD/SUB" is a 16-bit saturating add or subtract. Repeated blocks
+are shown once with a count.
+
+```mermaid
+flowchart TD
+  TW["twist_in 96 bit"] --> SH["SHIFT 1 ×6<br/>halve twist"]
+  SH --> M1["MUL ×48<br/>3 quaternion products"]
+  REG["REGISTER 128 FF<br/>async reset rst, enable en"] --> M1
+  M1 --> R1["RESCALE ×48<br/>shift 15, clamp"]
+  R1 --> A1["SAT ADD/SUB ×40"]
+
+  subgraph NEWTON["Normalize r: this block runs 4 times in series"]
+    direction TB
+    SQ["MUL ×4<br/>squares"] --> NA["ADD 34 bit ×3"]
+    NA --> NS["SUB 2^30 - sum"]
+    NS --> NH["SHIFT 16, clamp"]
+    NH --> NM["MUL ×4 + RESCALE ×4<br/>r × c"]
+    NM --> NAD["SAT ADD ×4"]
+  end
+
+  subgraph PROJ["Project d"]
+    direction TB
+    DM["MUL ×4<br/>r × d"] --> DA["ADD 34 bit ×3"]
+    DA --> DS["SHIFT 15, clamp<br/>= dot"]
+    DS --> SM["MUL ×4 + RESCALE ×4<br/>dot × r"]
+    SM --> SS["SAT SUB ×4<br/>d - dot·r"]
+  end
+
+  A1 -->|r| SQ
+  NAD -->|r| DM
+  A1 -->|d| DM
+  A1 -->|d| SS
+  NAD -->|r| SM
+  NAD -->|r| REG
+  SS -->|d| REG
+  REG --> POUT["pose_out 128 bit"]
+```
+
+Primitive counts in the generated chip, found by counting the generated code:
+
+| Primitive | Count |
+| :--- | :--- |
+| Multipliers (16 x 16 to 32 bit) | 88 (48 pose update, 32 normalization, 8 projection) |
+| 16-bit saturating add / subtract | 60 (38 add, 22 subtract) |
+| 34-bit adders (sums of products) | 15 |
+| Right shift by 15 (rescale) | 69 |
+| Right shift by 16 / by 1 | 4 / 6 |
+| Subtract from 2^30 | 4 |
+| Clamp muxes (34 to 16 bit) | 73 |
+| Registers | 1 (128 flip-flops, async reset, enable) |
+
 Bit layout, MSB first (16 bits per field):
 
 | Bus | Fields |
@@ -170,8 +225,9 @@ Expected output after the first cycle: `r.w = 32767`, `d.w = 2`, `d.x = 16384`,
 | `MasterChip.hs` with four Newton steps (current file): bit-accurate model over thousands of steps, full-range twists | Done: `abs(r^2 - 1)` at most 0.0002, `abs(r . d)` at most about 7 LSB off the rail |
 | Stress test wrapper: its reference model against the Python model over 4463 steps | Done: 0 mismatches |
 | Stress test wrapper: a correct stand-in chip passes; broken stand-ins fail (wrong z sign, 3 or 1 Newton steps, no projection, bad saturation, enable ignored) | Done (stand-in modules, not the real chip) |
-| `MasterChip.hs` with four Newton steps compiles with Clash | **Not yet checked** |
-| `MasterChip.hs` with four Newton steps passes the stress test in Makerchip | **Not yet checked** |
+| `MasterChip.hs` with four Newton steps compiles with Clash 1.8.5 | Done |
+| Generated chip (four Newton steps) on the full 4500-cycle stress test, in Verilator | Done: passes. 0 mismatches against the reference model over 4480 cycles and 0 against the Python model over 4463 update steps. Worst `abs(r^2 - 1)` 0.00014; worst `abs(r . d)` 3 LSB while `d` is off the rail (3286 of 4480 cycles). 4427 distinct poses seen |
+| The same stress test inside Makerchip | **Not yet checked** |
 
 Nothing here has been run on an FPGA, so timing and area are unknown.
 
