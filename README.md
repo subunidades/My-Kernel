@@ -48,8 +48,8 @@ Each clock cycle:
 1. `expMap`: the twist becomes a small pose step (rotation part
    `(1, wx/2, wy/2, wz/2)`, translation part `(0, vx/2, vy/2, vz/2)`).
 2. The step is multiplied into the current pose (dual quaternion product).
-3. One Newton step keeps the rotation `r` at length 1:
-   `r' = r + r (1 - |r|^2) / 2`.
+3. Four Newton steps keep the rotation `r` at length 1:
+   `r' = r + r (1 - |r|^2) / 2`, repeated four times.
 4. The projection from `Consensus.hs` removes the part of `d` parallel to `r`:
    `d' = d - (r . d) r`.
 5. The result is registered. `pose_out` is the registered pose.
@@ -59,7 +59,7 @@ flowchart TD
   TW["twist_in 96 bit"] --> EXP["expMap<br/>twist to small pose step"]
   EXP --> MULD["Dual quaternion multiply<br/>pose × step"]
   REG["REGISTER 128 FF<br/>pose"] --> MULD
-  MULD --> NORM["Normalize r<br/>one Newton step"]
+  MULD --> NORM["Normalize r<br/>4 Newton steps"]
   NORM --> PROJ["Project d<br/>d - (r·d) r"]
   PROJ --> REG
   REG --> POUT["pose_out 128 bit"]
@@ -79,17 +79,56 @@ Differences from `PoseEngine.hs` (needed for a correct result):
 - Products are rescaled back to Q1.15 (shift right by 15, then saturate).
   `PoseEngine.hs` multiplies without rescaling, so most products saturate.
 - The z component of the quaternion product uses the correct signs.
-- The rotation is renormalized every cycle.
+- The rotation is renormalized every cycle with four Newton steps. One step
+  is enough for small twists but not for large ones (see the table below).
 - The projection from `Consensus.hs` is part of the loop.
 
-Range limit: translation components (`d`) saturate at 1.0 (32767). A twist
-that pushes `d` past that leaves it on the rail, and `r . d` stops being small.
+### Why four Newton steps
+
+Bit-accurate model results (twists up to the stated size on every angular
+channel, thousands of steps; worst case seen):
+
+| Twist size | 1 step: worst `abs(r^2 - 1)` | 4 steps: worst `abs(r^2 - 1)` |
+| :--- | :--- | :--- |
+| up to 8000 | 0.0013 | 0.0001 |
+| up to 16000 | 0.017 | 0.0001 |
+| full range (+-32768) | 0.24 to 0.32 | 0.0002 |
+
+With full-range twists and one step, `r . d` stayed off by up to 3000 LSB;
+with four steps it stays within about 7 LSB while `d` is inside its range.
+The cost is about 24 more multipliers than a single step, and a longer
+combinational path (timing is not measured).
+
+### Limits
+
+- Translation components (`d`) saturate at 1.0 (32767). A twist that keeps
+  pushing `d` past that leaves it on the rail, and `r . d` is then no longer small.
+- `expMap` is first order. For `wx = 1000` the model rotates 6.1084 rad in
+  200 steps against 6.1030 rad for the exact map (0.09% difference).
+- The identity rotation is stored as 32767, which is just under 1.0.
 
 ### Test (`sim/wrapper_chip.sv`, written by `run.sh`)
 
-Constant twist `wx = 1000, vy = 100`. From cycle 120 on, `passed` goes high if
-the rotation has moved, `|r|` is within 0.2% of 1, and `|r . d|` is at most 8 raw
-units.
+A stress test with a bit-exact reference model built into the wrapper. The
+reference runs beside the chip and every output is compared on every cycle,
+for 4500 cycles. In addition, whenever `d` is off the rail, the chip output
+must have `abs(|r|^2 - 1) <= 0.2%` and `abs(r . d) <= 16` LSB.
+
+| Cycles | Stimulus |
+| :--- | :--- |
+| 40-259, 260-479, 480-699 | Rotation about x, then y, then z (a full turn each) |
+| 700-999 | Translation along x, y, z |
+| 1000-1199 | Rotation and translation together |
+| 1200-1439 | All 8 sign combinations of the maximum angular twist |
+| 1440-2399, 2403-2699, 2730-3399 | Random twists, full range on all six channels |
+| 2400-2402 | Reset in the middle of a run |
+| 2700-2729 | Enable low with random twists (state must hold) |
+| 3400-3899 | Random full-range rotation, small translation |
+| 3900-4499 | Random small twists |
+
+`passed` goes high at cycle 4500 if nothing failed. Three flags record the
+cause of a failure (`fail_cmp`, `fail_norm`, `fail_dot`) and are visible in
+the waveform.
 
 ## 4. Consensus kernel (`Consensus.hs`)
 
@@ -123,13 +162,16 @@ Expected output after the first cycle: `r.w = 32767`, `d.w = 2`, `d.x = 16384`,
 | Item | Status |
 | :--- | :--- |
 | `Consensus.hs` compiles with Clash 1.8.5 and passes the Makerchip test | Done |
-| `Consensus.hs` on 3000 random poses, unit `r`: `|r . d|` falls from mean 0.23 to under 1 LSB | Done (Verilator) |
-| `Consensus.hs` with non-unit `r` (length 0.8) | Projection does not fully work: mean `|r . d|` 0.069 |
-| `MasterChip.hs` algorithm, bit-accurate Python model, thousands of steps | `|r|` within 0.0002 of 1; `|r . d|` at most about 2 LSB while `d` is in range |
-| `MasterChip.hs` compiles with Clash | **Not yet checked** |
-| `MasterChip.hs` passes the Makerchip test | **Not yet checked** |
-| `PoseEngine.hs` compiles | **Not yet checked** |
+| `Consensus.hs` on 3000 random poses, unit `r`: `abs(r . d)` falls from mean 0.23 to under 1 LSB | Done (Verilator) |
+| `Consensus.hs` with non-unit `r` (length 0.8) | Projection does not fully work: mean `abs(r . d)` 0.069 |
+| `PoseEngine.hs` compiles with Clash | Done |
 | `PoseEngine.hs` arithmetic is correct | No: products are not rescaled and the z term has wrong signs |
+| `MasterChip.hs` with one Newton step: compiles, and passes the simple Makerchip test (constant twist, 120 cycles) | Done |
+| `MasterChip.hs` with four Newton steps (current file): bit-accurate model over thousands of steps, full-range twists | Done: `abs(r^2 - 1)` at most 0.0002, `abs(r . d)` at most about 7 LSB off the rail |
+| Stress test wrapper: its reference model against the Python model over 4463 steps | Done: 0 mismatches |
+| Stress test wrapper: a correct stand-in chip passes; broken stand-ins fail (wrong z sign, 3 or 1 Newton steps, no projection, bad saturation, enable ignored) | Done (stand-in modules, not the real chip) |
+| `MasterChip.hs` with four Newton steps compiles with Clash | **Not yet checked** |
+| `MasterChip.hs` with four Newton steps passes the stress test in Makerchip | **Not yet checked** |
 
 Nothing here has been run on an FPGA, so timing and area are unknown.
 
