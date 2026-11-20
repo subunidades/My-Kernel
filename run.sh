@@ -1,414 +1,66 @@
 #!/usr/bin/env bash
-# my-kernel: one-file build. Needs only this file plus the .hs designs:
-# Consensus.hs (required), PoseEngine.hs and MasterChip.hs (optional). Run from the folder that holds them:
-#   bash run.sh
-# Does everything: toolchain -> Clash -> SystemVerilog -> Makerchip bundle.
+# my-kernel: build and verify everything with one command.
+#   bash run.sh                run everything
+#   SKIP_BUILD=1 bash run.sh   skip the toolchain/Clash steps; re-bundle and re-simulate
+#                              the SystemVerilog already in systemverilog/
 set -euo pipefail
 cd "$(dirname "$0")"
 
-[ -f Consensus.hs ] || { echo "Consensus.hs not found in $(pwd)"; exit 1; }
-
-# ---------------------------------------------------------------- 1. toolchain
-if [ ! -f "$HOME/.ghcup/env" ]; then
-  export BOOTSTRAP_HASKELL_NONINTERACTIVE=1
-  export BOOTSTRAP_HASKELL_GHC_VERSION=9.6.6
-  curl --proto '=https' --tlsv1.2 -sSf https://get-ghcup.haskell.org | sh
-fi
-source "$HOME/.ghcup/env"
-ghcup install ghc 9.6.6 --set
-cabal update
-
-# ---------------------------------------------------------------- 2. project files
-mkdir -p bin sim
-
-cat > my-kernel.cabal << '__CABAL__'
-cabal-version: 2.4
-name: my-kernel
-version: 0.1
-build-type: Simple
-
-executable clash
-  main-is: Clash.hs
-  hs-source-dirs: bin
-  default-language: Haskell2010
-  build-depends: base, clash-ghc ^>=1.8, clash-prelude ^>=1.8,
-                 ghc-typelits-natnormalise, ghc-typelits-extra,
-                 ghc-typelits-knownnat
-__CABAL__
-
-cat > cabal.project << '__PROJECT__'
-packages: .
-write-ghc-environment-files: always
-__PROJECT__
-
-cat > bin/Clash.hs << '__LAUNCHER__'
-import Clash.Main (defaultMain)
-import System.Environment (getArgs)
-main :: IO ()
-main = getArgs >>= defaultMain
-__LAUNCHER__
-
-cat > sim/wrapper.sv << '__WRAPPER__'
-// Makerchip test wrapper for the Consensus kernel (module "kernel").
-// Pose bus layout (128 bits, MSB first):
-//   [127:112] rW  [111:96] rX  [95:80] rY  [79:64] rZ
-//   [63:48]   dW  [47:32]  dX  [31:16] dY  [15:0]  dZ
-// Test: feed an off-manifold pose (r = identity, d.w = 0.5, so r.d = 0.5).
-// After projection, r.d must be ~0 and r must be unchanged.
-module top(input wire clk, input wire reset, input wire [31:0] cyc_cnt,
-           output wire passed, output wire failed);
-
-  wire [127:0] pose_in  = {16'sh7FFF, 16'sh0000, 16'sh0000, 16'sh0000,
-                           16'sh4000, 16'sh4000, 16'sh0000, 16'sh0000};
-  wire [127:0] pose_out;
-
-  kernel dut (.clk(clk), .rst(reset), .en(1'b1),
-              .pose_in(pose_in), .pose_out(pose_out));
-
-  wire signed [15:0] o_rW = pose_out[127:112];
-  wire signed [15:0] o_rX = pose_out[111:96];
-  wire signed [15:0] o_rY = pose_out[95:80];
-  wire signed [15:0] o_rZ = pose_out[79:64];
-  wire signed [15:0] o_dW = pose_out[63:48];
-  wire signed [15:0] o_dX = pose_out[47:32];
-  wire signed [15:0] o_dY = pose_out[31:16];
-  wire signed [15:0] o_dZ = pose_out[15:0];
-
-  wire signed [31:0] dot_full = o_rW*o_dW + o_rX*o_dX + o_rY*o_dY + o_rZ*o_dZ;
-  wire signed [31:0] dot      = dot_full >>> 15;
-
-  wire ok = (o_rW == 16'sh7FFF) && (dot >= -4) && (dot <= 4);
-
-  assign passed = (cyc_cnt >= 32'd10) &&  ok;
-  assign failed = (cyc_cnt >= 32'd10) && !ok;
-endmodule
-__WRAPPER__
-
-cat > sim/wrapper_chip.sv << '__CHIPWRAPPER__'
-// Makerchip STRESS test for the combined chip (module "chip").
-// twist_in (96 bits, MSB first): wx wy wz vx vy vz, 16 bits each.
-// pose_out (128 bits): rW rX rY rZ dW dX dY dZ, 16 bits each.
-//
-// A bit-exact reference model (functions below, same Q1.15 maths as
-// MasterChip.hs) runs beside the chip and is compared EVERY cycle.
-// In addition the chip output must satisfy, whenever d is off the +-1.0 rail:
-//   | |r|^2 - 1 | <= 0.2%   and   |r . d| <= 16 LSB.
-//
-// Schedule (cycle counter):
-//   40-259 rotate x   260-479 rotate y   480-699 rotate z   (full turn each)
-//   700-999 translate x, y, z            1000-1199 rotation + translation
-//   1200-1439 all 8 corners of the maximum angular twist
-//   1440-2399 random, full range (all 6 channels)
-//   2400-2402 mid-run reset              2403-2699 random, full range
-//   2700-2729 enable LOW with random twists (state must hold)
-//   2730-3399 random, full range        3400-3899 random full-range angular,
-//                                                  small linear (d stays in range)
-//   3900-4499 random small twists        4500 -> PASS if nothing failed
-module top(input wire clk, input wire reset, input wire [31:0] cyc_cnt,
-           output wire passed, output wire failed);
-
-  // BEGIN FUNCS
-  function automatic signed [15:0] clampf(input signed [33:0] v);
-    begin
-      if (v > 34'sd32767)       clampf = 16'sd32767;
-      else if (v < -34'sd32767) clampf = -16'sd32767;
-      else                      clampf = v[15:0];
-    end
-  endfunction
-
-  function automatic signed [33:0] prod34(input signed [15:0] a, input signed [15:0] b);
-    reg signed [31:0] p;
-    begin
-      p = a * b;
-      prod34 = {{2{p[31]}}, p};
-    end
-  endfunction
-
-  function automatic signed [15:0] mulf(input signed [15:0] a, input signed [15:0] b);
-    reg signed [33:0] sh;
-    begin
-      sh = prod34(a, b) >>> 15;
-      mulf = clampf(sh);
-    end
-  endfunction
-
-  // SatSymmetric add/sub as generated by Clash: exact result is kept when it
-  // fits in 16 bits signed (so -32768 can occur); otherwise clamp to +-32767.
-  function automatic signed [15:0] addf(input signed [15:0] a, input signed [15:0] b);
-    reg signed [16:0] s;
-    begin
-      s = {a[15], a} + {b[15], b};
-      if (s[16] == s[15]) addf = s[15:0];
-      else if (s[16])     addf = -16'sd32767;
-      else                addf = 16'sd32767;
-    end
-  endfunction
-
-  function automatic signed [15:0] subf(input signed [15:0] a, input signed [15:0] b);
-    reg signed [16:0] s;
-    begin
-      s = {a[15], a} - {b[15], b};
-      if (s[16] == s[15]) subf = s[15:0];
-      else if (s[16])     subf = -16'sd32767;
-      else                subf = 16'sd32767;
-    end
-  endfunction
-
-  // quaternion packed as {w,x,y,z}, 16 bits each
-  function automatic [63:0] qmulf(input [63:0] p, input [63:0] q);
-    reg signed [15:0] w1, x1, y1, z1, w2, x2, y2, z2, w, x, y, z;
-    begin
-      {w1, x1, y1, z1} = p;
-      {w2, x2, y2, z2} = q;
-      w = subf(subf(subf(mulf(w1,w2), mulf(x1,x2)), mulf(y1,y2)), mulf(z1,z2));
-      x = subf(addf(addf(mulf(w1,x2), mulf(x1,w2)), mulf(y1,z2)), mulf(z1,y2));
-      y = addf(addf(subf(mulf(w1,y2), mulf(x1,z2)), mulf(y1,w2)), mulf(z1,x2));
-      z = addf(subf(addf(mulf(w1,z2), mulf(x1,y2)), mulf(y1,x2)), mulf(z1,w2));
-      qmulf = {w, x, y, z};
-    end
-  endfunction
-
-  function automatic [63:0] qaddf(input [63:0] p, input [63:0] q);
-    reg signed [15:0] w1, x1, y1, z1, w2, x2, y2, z2;
-    begin
-      {w1, x1, y1, z1} = p;
-      {w2, x2, y2, z2} = q;
-      qaddf = {addf(w1,w2), addf(x1,x2), addf(y1,y2), addf(z1,z2)};
-    end
-  endfunction
-
-  // one Newton step toward |r| = 1:  r + r*(1-|r|^2)/2
-  function automatic [63:0] normf(input [63:0] q);
-    reg signed [15:0] w, x, y, z, c;
-    reg signed [33:0] n, c34;
-    begin
-      {w, x, y, z} = q;
-      n   = prod34(w,w) + prod34(x,x) + prod34(y,y) + prod34(z,z);
-      c34 = (34'sd1073741824 - n) >>> 16;
-      c   = clampf(c34);
-      normf = {addf(w, mulf(w,c)), addf(x, mulf(x,c)), addf(y, mulf(y,c)), addf(z, mulf(z,c))};
-    end
-  endfunction
-
-  function automatic signed [15:0] dotf(input [63:0] r, input [63:0] d);
-    reg signed [15:0] w1, x1, y1, z1, w2, x2, y2, z2;
-    reg signed [33:0] s;
-    begin
-      {w1, x1, y1, z1} = r;
-      {w2, x2, y2, z2} = d;
-      s = prod34(w1,w2) + prod34(x1,x2) + prod34(y1,y2) + prod34(z1,z2);
-      s = s >>> 15;
-      dotf = clampf(s);
-    end
-  endfunction
-
-  function automatic [127:0] stepf(input [127:0] pose, input [95:0] tw);
-    reg signed [15:0] wx, wy, wz, vx, vy, vz;
-    reg signed [15:0] rw, rx, ry, rz, dW, dX, dY, dZ, dt;
-    reg [63:0] r, d, rd, dd, nr, nd, r1;
-    begin
-      {wx, wy, wz, vx, vy, vz} = tw;
-      r  = pose[127:64];
-      d  = pose[63:0];
-      rd = {16'sd32767, wx >>> 1, wy >>> 1, wz >>> 1};
-      dd = {16'sd0,     vx >>> 1, vy >>> 1, vz >>> 1};
-      nr = qmulf(r, rd);
-      nd = qaddf(qmulf(r, dd), qmulf(d, rd));
-      r1 = normf(normf(normf(normf(nr))));
-      dt = dotf(r1, nd);
-      {rw, rx, ry, rz} = r1;
-      {dW, dX, dY, dZ} = nd;
-      stepf = {r1, subf(dW, mulf(dt, rw)), subf(dX, mulf(dt, rx)),
-                   subf(dY, mulf(dt, ry)), subf(dZ, mulf(dt, rz))};
-    end
-  endfunction
-
-  function automatic [31:0] xs32(input [31:0] x);
-    reg [31:0] a, b, c;
-    begin
-      a = x ^ (x << 13);
-      b = a ^ (a >> 17);
-      c = b ^ (b << 5);
-      xs32 = c;
-    end
-  endfunction
-  // END FUNCS
-
-  // ---------------- stimulus (all registered: no races) ----------------
-  reg [31:0] l0 = 32'h1BADB002, l1 = 32'hDEADBEEF, l2 = 32'h0C0FFEE1,
-             l3 = 32'h13579BDF, l4 = 32'h2468ACE1, l5 = 32'h7F4A7C15;
-  always @(posedge clk) begin
-    l0 <= xs32(l0); l1 <= xs32(l1); l2 <= xs32(l2);
-    l3 <= xs32(l3); l4 <= xs32(l4); l5 <= xs32(l5);
-  end
-
-  reg signed [15:0] t_wx, t_wy, t_wz, t_vx, t_vy, t_vz;
-  reg               t_en, t_rst;
-  always @* begin
-    t_wx = 16'sd0; t_wy = 16'sd0; t_wz = 16'sd0;
-    t_vx = 16'sd0; t_vy = 16'sd0; t_vz = 16'sd0;
-    t_en = 1'b1;   t_rst = 1'b0;
-    if      (cyc_cnt <  32'd40)   begin end
-    else if (cyc_cnt <  32'd260)  t_wx = 16'sd1000;
-    else if (cyc_cnt <  32'd480)  t_wy = 16'sd1000;
-    else if (cyc_cnt <  32'd700)  t_wz = 16'sd1000;
-    else if (cyc_cnt <  32'd800)  t_vx = 16'sd300;
-    else if (cyc_cnt <  32'd900)  t_vy = 16'sd300;
-    else if (cyc_cnt <  32'd1000) t_vz = 16'sd300;
-    else if (cyc_cnt <  32'd1200) begin
-      t_wx = 16'sd1000; t_wy = 16'sd700; t_wz = -16'sd400;
-      t_vx = 16'sd200;  t_vy = -16'sd100; t_vz = 16'sd150;
-    end
-    else if (cyc_cnt <  32'd1440) begin
-      t_wx = cyc_cnt[0] ? 16'sd32767 : -16'sd32768;
-      t_wy = cyc_cnt[1] ? 16'sd32767 : -16'sd32768;
-      t_wz = cyc_cnt[2] ? 16'sd32767 : -16'sd32768;
-    end
-    else if (cyc_cnt <  32'd2400) begin
-      t_wx = l0[15:0]; t_wy = l1[15:0]; t_wz = l2[15:0];
-      t_vx = l3[15:0]; t_vy = l4[15:0]; t_vz = l5[15:0];
-    end
-    else if (cyc_cnt <  32'd2403) t_rst = 1'b1;
-    else if (cyc_cnt <  32'd2700) begin
-      t_wx = l0[15:0]; t_wy = l1[15:0]; t_wz = l2[15:0];
-      t_vx = l3[15:0]; t_vy = l4[15:0]; t_vz = l5[15:0];
-    end
-    else if (cyc_cnt <  32'd2730) begin
-      t_en = 1'b0;
-      t_wx = l0[15:0]; t_wy = l1[15:0]; t_wz = l2[15:0];
-      t_vx = l3[15:0]; t_vy = l4[15:0]; t_vz = l5[15:0];
-    end
-    else if (cyc_cnt <  32'd3400) begin
-      t_wx = l0[15:0]; t_wy = l1[15:0]; t_wz = l2[15:0];
-      t_vx = l3[15:0]; t_vy = l4[15:0]; t_vz = l5[15:0];
-    end
-    else if (cyc_cnt <  32'd3900) begin
-      t_wx = l0[15:0]; t_wy = l1[15:0]; t_wz = l2[15:0];
-      t_vx = {{9{l3[6]}}, l3[6:0]}; t_vy = {{9{l4[6]}}, l4[6:0]}; t_vz = {{9{l5[6]}}, l5[6:0]};
-    end
-    else begin
-      t_wx = {{4{l0[11]}}, l0[11:0]}; t_wy = {{4{l1[11]}}, l1[11:0]}; t_wz = {{4{l2[11]}}, l2[11:0]};
-      t_vx = {{4{l3[11]}}, l3[11:0]}; t_vy = {{4{l4[11]}}, l4[11:0]}; t_vz = {{4{l5[11]}}, l5[11:0]};
-    end
-  end
-
-  reg [95:0] tw_q  = 96'd0;
-  reg        en_q  = 1'b1;
-  reg        rst_q = 1'b1;
-  always @(posedge clk) begin
-    tw_q  <= {t_wx, t_wy, t_wz, t_vx, t_vy, t_vz};
-    en_q  <= t_en;
-    rst_q <= reset | t_rst;
-  end
-
-  // ---------------- device under test ----------------
-  wire [127:0] pose_out;
-  chip dut (.clk(clk), .rst(rst_q), .en(en_q), .twist_in(tw_q), .pose_out(pose_out));
-
-  // ---------------- reference model ----------------
-  localparam [127:0] IDENT = {16'sh7FFF, 16'h0000, 16'h0000, 16'h0000,
-                              16'h0000,  16'h0000, 16'h0000, 16'h0000};
-  reg [127:0] ref_pose = IDENT;
-  always @(posedge clk or posedge rst_q) begin
-    if (rst_q)     ref_pose <= IDENT;
-    else if (en_q) ref_pose <= stepf(ref_pose, tw_q);
-  end
-
-  // ---------------- checks ----------------
-  wire signed [15:0] o_rW = pose_out[127:112];
-  wire signed [15:0] o_rX = pose_out[111:96];
-  wire signed [15:0] o_rY = pose_out[95:80];
-  wire signed [15:0] o_rZ = pose_out[79:64];
-  wire signed [15:0] o_dW = pose_out[63:48];
-  wire signed [15:0] o_dX = pose_out[47:32];
-  wire signed [15:0] o_dY = pose_out[31:16];
-  wire signed [15:0] o_dZ = pose_out[15:0];
-
-  wire signed [33:0] nsq  = prod34(o_rW,o_rW) + prod34(o_rX,o_rX) + prod34(o_rY,o_rY) + prod34(o_rZ,o_rZ);
-  wire signed [33:0] nerr = nsq - 34'sd1073741824;
-  wire norm_ok = (nerr > -34'sd2147483) && (nerr < 34'sd2147483);
-
-  wire signed [33:0] dsum = prod34(o_rW,o_dW) + prod34(o_rX,o_dX) + prod34(o_rY,o_dY) + prod34(o_rZ,o_dZ);
-  wire signed [33:0] dotv = dsum >>> 15;
-  wire dot_ok = (dotv >= -34'sd16) && (dotv <= 34'sd16);
-
-  wire rail = (o_dW >= 16'sd32767) || (o_dW <= -16'sd32767) ||
-              (o_dX >= 16'sd32767) || (o_dX <= -16'sd32767) ||
-              (o_dY >= 16'sd32767) || (o_dY <= -16'sd32767) ||
-              (o_dZ >= 16'sd32767) || (o_dZ <= -16'sd32767);
-
-  wire cmp_en = (cyc_cnt >= 32'd20);
-  reg fail_cmp = 1'b0, fail_norm = 1'b0, fail_dot = 1'b0;
-  always @(posedge clk) begin
-    if (cmp_en) begin
-      if (pose_out != ref_pose)    fail_cmp  <= 1'b1;
-      if (!rail && !norm_ok)       fail_norm <= 1'b1;
-      if (!rail && !dot_ok)        fail_dot  <= 1'b1;
-    end
-  end
-
-  assign failed = fail_cmp | fail_norm | fail_dot;
-  assign passed = (cyc_cnt >= 32'd4500) && !failed;
-endmodule
-__CHIPWRAPPER__
-
-# ---------------------------------------------------------------- 3. build Clash
-cabal build
-
-# ---------------------------------------------------------------- 4. synthesize
-rm -rf systemverilog
-cabal run clash -- --systemverilog Consensus.hs
-
-# PoseEngine.hs (standalone update engine). Reports the result but never
-# stops the script.
-if [ -f PoseEngine.hs ]; then
-  echo
-  echo "=== PoseEngine.hs ==="
-  if cabal run clash -- --systemverilog PoseEngine.hs; then
-    echo "PoseEngine.hs: compiled."
-  else
-    echo "PoseEngine.hs: did NOT compile (messages above)."
-  fi
-fi
-
-# Combined chip (PoseEngine update + Consensus projection). Reports the
-# result but never stops the script, so Consensus is unaffected.
-CHIP_OK=0
-if [ -f MasterChip.hs ]; then
-  echo
-  echo "=== MasterChip.hs ==="
-  if cabal run clash -- --systemverilog MasterChip.hs; then
-    CHIP_OK=1
-    echo "MasterChip.hs: compiled."
-  else
-    echo "MasterChip.hs: did NOT compile (messages above). Consensus is unaffected."
-  fi
-fi
-
-# ---------------------------------------------------------------- 5. Makerchip bundle
-OUT=makerchip_bundle.sv
-: > "$OUT"
-for f in $(find systemverilog/Consensus.* -name '*types*.sv' | sort) \
-         $(find systemverilog/Consensus.* -name '*.sv' ! -name '*types*' | sort); do
-  cat "$f" >> "$OUT"; echo >> "$OUT"
+for f in Consensus.hs my-kernel.cabal cabal.project bin/Clash.hs \
+         sim/wrapper.sv sim/tb.sv sim/run_sim.sh sim/check_dump.py sim/model.py sim/test_quat.py; do
+  [ -f "$f" ] || { echo "ERROR: missing $f (unzip the whole repo and run from its folder)"; exit 1; }
 done
-cat sim/wrapper.sv >> "$OUT"
 
-grep -q '^module kernel' "$OUT" || { echo "ERROR: kernel module missing from $OUT"; exit 1; }
+# ------------------------------------------------------------ 1-3. toolchain, Clash, synthesis
+if [ "${SKIP_BUILD:-0}" != 1 ]; then
+  if [ ! -f "$HOME/.ghcup/env" ]; then
+    export BOOTSTRAP_HASKELL_NONINTERACTIVE=1
+    export BOOTSTRAP_HASKELL_GHC_VERSION=9.6.6
+    curl --proto '=https' --tlsv1.2 -sSf https://get-ghcup.haskell.org | sh
+  fi
+  source "$HOME/.ghcup/env"
+  ghcup install ghc 9.6.6 --set
+  cabal update
+  cabal build
 
-if [ "$CHIP_OK" = 1 ]; then
-  CHIPOUT=makerchip_chip_bundle.sv
-  : > "$CHIPOUT"
-  for f in $(find systemverilog/MasterChip.* -name '*types*.sv' | sort) \
-           $(find systemverilog/MasterChip.* -name '*.sv' ! -name '*types*' | sort); do
-    cat "$f" >> "$CHIPOUT"; echo >> "$CHIPOUT"
+  rm -rf systemverilog
+  cabal run clash -- --systemverilog Consensus.hs            # required
+  for d in PoseEngine MasterChip; do                        # optional: never stop the script
+    if [ -f "$d.hs" ]; then
+      echo; echo "=== $d.hs ==="
+      if cabal run clash -- --systemverilog "$d.hs"; then echo "$d.hs: compiled."
+      else echo "$d.hs: did NOT compile (messages above)."; fi
+    fi
   done
-  cat sim/wrapper_chip.sv >> "$CHIPOUT"
-  grep -q '^module chip' "$CHIPOUT" || { echo "ERROR: chip module missing from $CHIPOUT"; exit 1; }
-  echo
-  echo "CHIP bundle: $CHIPOUT  (paste into Makerchip; expect: Simulation PASSED!!!)"
 fi
+
+# ------------------------------------------------------------ 4. Makerchip bundles
+bundle() {   # design  wrapper  output  module-name
+  local design="$1" wrapper="$2" out="$3" mod="$4"
+  [ -n "$(find systemverilog -path "systemverilog/$design.*" -name '*.sv' 2>/dev/null)" ] || return 1
+  : > "$out"
+  for f in $(find systemverilog -path "systemverilog/$design.*" -name '*types*.sv' | sort) \
+           $(find systemverilog -path "systemverilog/$design.*" -name '*.sv' ! -name '*types*' | sort); do
+    cat "$f" >> "$out"; echo >> "$out"
+  done
+  cat "$wrapper" >> "$out"
+  grep -q "^module $mod" "$out" || { echo "ERROR: module $mod missing from $out"; return 1; }
+}
+bundle Consensus sim/wrapper.sv makerchip_bundle.sv kernel || { echo "ERROR: Consensus bundle failed"; exit 1; }
+HAVE_POSE=0; HAVE_CHIP=0
+[ -f sim/wrapper_pose.sv ] && bundle PoseEngine sim/wrapper_pose.sv makerchip_pose_bundle.sv pose_engine && HAVE_POSE=1 || true
+[ -f sim/wrapper_chip.sv ] && bundle MasterChip sim/wrapper_chip.sv makerchip_chip_bundle.sv chip && HAVE_CHIP=1 || true
+
+# ------------------------------------------------------------ 5. local simulation (Verilator)
+echo; echo "=== verification ==="
+FAIL=0
+run() { local rc=0; bash sim/run_sim.sh "$@" || rc=$?; [ "$rc" -eq 1 ] && FAIL=1; return 0; }
+python3 sim/test_quat.py | sed 's/^/MODEL quaternion product: /' || FAIL=1
+run makerchip_bundle.sv consensus
+[ "$HAVE_POSE" = 1 ] && run makerchip_pose_bundle.sv pose_engine pose
+[ "$HAVE_CHIP" = 1 ] && run makerchip_chip_bundle.sv chip chip
 
 echo
-echo "DONE. Open $OUT, copy everything, paste into https://www.makerchip.com/ide"
-echo "Expected in the Makerchip LOG: Simulation PASSED!!!"
+echo "Bundles written (each can also be pasted into https://www.makerchip.com/ide):"
+ls makerchip_*bundle.sv
+if [ "$FAIL" = 0 ]; then echo "ALL CHECKS PASSED."; else echo "SOME CHECKS FAILED (see lines above)."; exit 1; fi
