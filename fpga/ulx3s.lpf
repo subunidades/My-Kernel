@@ -1,0 +1,14 @@
+# ULX3S (LFE5U-85F-6BG381C) pins for the wrapper. Pin sites are from the ULX3S
+# documentation as remembered; CHECK THEM against the board schematic before
+# programming a board.
+LOCATE COMP "clk_25mhz" SITE "G2";
+IOBUF PORT "clk_25mhz" PULLMODE=NONE IO_TYPE=LVCMOS33;
+FREQUENCY PORT "clk_25mhz" 25 MHZ;
+LOCATE COMP "rst"     SITE "R1";   # button FIRE1
+IOBUF PORT "rst"     PULLMODE=DOWN IO_TYPE=LVCMOS33;
+LOCATE COMP "en"      SITE "T1";   # button FIRE2
+IOBUF PORT "en"      PULLMODE=DOWN IO_TYPE=LVCMOS33;
+LOCATE COMP "ser_in"  SITE "R18";  # button UP
+IOBUF PORT "ser_in"  PULLMODE=DOWN IO_TYPE=LVCMOS33;
+LOCATE COMP "ser_out" SITE "B2";   # LED 0
+IOBUF PORT "ser_out" PULLMODE=NONE IO_TYPE=LVCMOS33;
