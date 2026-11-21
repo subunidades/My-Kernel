@@ -230,7 +230,7 @@ Expected output after the first cycle: `r.w = 32767`, `d.w = 2`, `d.x = 16384`,
 | Original `PoseEngine.hs` compiles with Clash | Done (it compiled, but its arithmetic was wrong: no Q1.15 rescaling, wrong signs in the z term) |
 | Fixed `PoseEngine.hs` (Q1.15 rescaling, correct z term, explicit port names) quaternion maths against exact floating-point maths | Done: worst error 2.9 LSB over 20000 random unit pairs; the test fails on both original bugs |
 | `sim/wrapper_pose.sv` and the Python model, on a stand-in `pose_engine` module | Done: 0 mismatches over 4446 update steps; the wrapper fails on a wrong z term, missing rescaling, a registered (Moore) output and an ignored enable |
-| Fixed `PoseEngine.hs` compiles with Clash and its generated hardware passes `sim/wrapper_pose.sv` | **Not yet checked** (Clash could not be run where the fix was made) |
+| Fixed `PoseEngine.hs` compiles with Clash 1.8.5, and its generated hardware passes `sim/wrapper_pose.sv` (4500 cycles) | Done: 0 mismatches against the reference model, and 0 against the Python model over 4446 update steps |
 | `MasterChip.hs` with one Newton step: compiles, and passes the simple Makerchip test (constant twist, 120 cycles) | Done |
 | `MasterChip.hs` with four Newton steps (current file): bit-accurate model over thousands of steps, full-range twists | Done: `abs(r^2 - 1)` at most 0.0002, `abs(r . d)` at most about 7 LSB off the rail |
 | Stress test wrapper: its reference model against the Python model over 4463 steps | Done: 0 mismatches |
