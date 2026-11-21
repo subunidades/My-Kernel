@@ -8,9 +8,10 @@ bundle="$1"; label="$2"; mode="${3:-}"
 here="$(cd "$(dirname "$0")" && pwd)"
 
 if ! command -v verilator >/dev/null 2>&1; then
-  (sudo -n apt-get install -y verilator || apt-get install -y verilator) >/dev/null 2>&1 || true
+  (sudo -n apt-get update && sudo -n apt-get install -y verilator) >/dev/null 2>&1 \
+    || (apt-get update && apt-get install -y verilator) >/dev/null 2>&1 || true
 fi
-command -v verilator >/dev/null 2>&1 || { echo "SIM $label: SKIPPED (Verilator not available)"; exit 2; }
+command -v verilator >/dev/null 2>&1 || { echo "SIM $label: SKIPPED (Verilator not installed)"; exit 2; }
 
 work="$(mktemp -d)"
 build() {   # $1 = extra defines
