@@ -53,8 +53,8 @@ HAVE_POSE=0; HAVE_CHIP=0
 
 # ------------------------------------------------------------ 5. local simulation (Verilator)
 echo; echo "=== verification ==="
-FAIL=0
-run() { local rc=0; bash sim/run_sim.sh "$@" || rc=$?; [ "$rc" -eq 1 ] && FAIL=1; return 0; }
+FAIL=0; SKIP=0
+run() { local rc=0; bash sim/run_sim.sh "$@" || rc=$?; [ "$rc" -eq 1 ] && FAIL=1; [ "$rc" -eq 2 ] && SKIP=$((SKIP+1)); return 0; }
 python3 sim/test_quat.py | sed 's/^/MODEL quaternion product: /' || FAIL=1
 run makerchip_bundle.sv consensus
 [ "$HAVE_POSE" = 1 ] && run makerchip_pose_bundle.sv pose_engine pose
@@ -63,4 +63,9 @@ run makerchip_bundle.sv consensus
 echo
 echo "Bundles written (each can also be pasted into https://www.makerchip.com/ide):"
 ls makerchip_*bundle.sv
-if [ "$FAIL" = 0 ]; then echo "ALL CHECKS PASSED."; else echo "SOME CHECKS FAILED (see lines above)."; exit 1; fi
+if [ "$FAIL" != 0 ]; then echo "SOME CHECKS FAILED (see lines above)."; exit 1
+elif [ "$SKIP" != 0 ]; then
+  echo "INCOMPLETE: $SKIP simulation(s) were SKIPPED because Verilator is not installed."
+  echo "Fix:  sudo apt-get update && sudo apt-get install -y verilator && SKIP_BUILD=1 bash run.sh"
+  exit 2
+else echo "ALL CHECKS PASSED."; fi
